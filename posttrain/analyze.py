@@ -25,6 +25,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -109,6 +110,7 @@ class Signal:
     seeds: np.ndarray
     concepts: np.ndarray
     mass: np.ndarray  # [n_layers + 1] mean yes+no mass
+    directional: bool = False  # only a positive gap counts (detection: injection -> more 'yes')
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -161,9 +163,12 @@ def build_signal(
 
 
 def detection_signal(runs: list[Run], prompt: str, phase: str = "main") -> Signal | None:
-    return build_signal(
+    sig = build_signal(
         runs, phase, lambda x: x["prompt"] == prompt, ("prompt",), lambda x: x["inj"]
     )
+    if sig is not None:
+        sig.directional = True
+    return sig
 
 
 def confusing_signal(runs: list[Run], prompt: str) -> Signal | None:
@@ -290,8 +295,12 @@ def diff_ci(a: Atten, b: Atten, key: str) -> dict[str, Any]:
     }
 
 
-def cv_method(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray):
-    """Peak layer chosen on the other folds, measured on the left-out fold."""
+def cv_method(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray, directional: bool = False):
+    """Peak layer chosen on the other folds, measured on the left-out fold.
+
+    directional: peak = largest positive gap and the sign stays +; otherwise largest |gap|,
+    sign-aligned so the peak is positive.
+    """
     final = rows.shape[1] - 1
     cand = valid.copy()
     cand[final] = False
@@ -304,8 +313,12 @@ def cv_method(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray):
     for f in folds:
         test = groups == f
         mean_train = rows[~test].mean(0)
-        p = int(idx[np.argmax(np.abs(mean_train[idx]))])
-        sign = np.sign(mean_train[p]) or 1.0
+        if directional:
+            p = int(idx[np.argmax(mean_train[idx])])
+            sign = 1.0
+        else:
+            p = int(idx[np.argmax(np.abs(mean_train[idx]))])
+            sign = np.sign(mean_train[p]) or 1.0
         win = [layer for layer in range(p - PEAK_HALF_WIDTH, p + PEAK_HALF_WIDTH + 1) if 0 <= layer < final and cand[layer]]
         peak[test] = sign * rows[test][:, win].mean(1)
         fin[test] = sign * rows[test][:, final]
@@ -313,29 +326,34 @@ def cv_method(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray):
     return peak, fin, peak_layers
 
 
-def fixed_method(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray):
+def fixed_method(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray, directional: bool = False):
     """Pre-set relative-depth window; no peak selection (cross-check)."""
     del groups
     n_layers = rows.shape[1] - 1
     win = [layer for layer in range(n_layers) if FIXED_WINDOW[0] <= layer / n_layers <= FIXED_WINDOW[1] and valid[layer]]
     if not win:
         return None
-    sign = np.sign(rows[:, win].mean()) or 1.0
+    sign = 1.0 if directional else (np.sign(rows[:, win].mean()) or 1.0)
     return sign * rows[:, win].mean(1), sign * rows[:, -1], win
 
 
-def cv_attenuation(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray) -> Atten | None:
-    return Atten(rows, groups, valid, cv_method) if cv_method(rows, groups, valid) else None
+def cv_attenuation(rows: np.ndarray, groups: np.ndarray, valid: np.ndarray, directional: bool = False) -> Atten | None:
+    method = partial(cv_method, directional=directional)
+    return Atten(rows, groups, valid, method) if method(rows, groups, valid) else None
 
 
-def fixed_attenuation(rows: np.ndarray, valid: np.ndarray) -> Atten | None:
+def fixed_attenuation(rows: np.ndarray, valid: np.ndarray, directional: bool = False) -> Atten | None:
     groups = np.zeros(len(rows), dtype=int)
-    return Atten(rows, groups, valid, fixed_method) if fixed_method(rows, groups, valid) else None
+    method = partial(fixed_method, directional=directional)
+    return Atten(rows, groups, valid, method) if method(rows, groups, valid) else None
 
 
 def signal_attenuation(sig: Signal, min_mass: float) -> tuple[Atten | None, Atten | None]:
     valid = sig.valid(min_mass)
-    return cv_attenuation(sig.rows, sig.groups(), valid), fixed_attenuation(sig.rows, valid)
+    return (
+        cv_attenuation(sig.rows, sig.groups(), valid, sig.directional),
+        fixed_attenuation(sig.rows, valid, sig.directional),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -546,8 +564,11 @@ def ablate_check(runs: list[Run]) -> dict[str, Any] | None:
 
 def verdict(res: dict[str, Any], swaps: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     conds = res["conditions"]
+    # Same criterion as the step 0 existence check: peak gap >= EXIST_MIN_GAP, CI > 0.
     base_signal = all(
-        (c["detection"]["base"] or {}).get("cv") and c["detection"]["base"]["cv"]["peak_ci"][0] > 0
+        (c["detection"]["base"] or {}).get("cv")
+        and c["detection"]["base"]["cv"]["peak"] >= EXIST_MIN_GAP
+        and c["detection"]["base"]["cv"]["peak_ci"][0] > 0
         for c in conds.values()
     )
     c1 = all(above(c["detection"].get("diff_cv", {}).get("att")) for c in conds.values())
@@ -572,11 +593,10 @@ def verdict(res: dict[str, Any], swaps: dict[str, Any]) -> tuple[str, dict[str, 
     )
     if not base_fades:
         return "Neither model shows clear attenuation", crit
-    generic = any(
-        (c[bl]["base"] or {}).get("cv") and c[bl]["base"]["cv"]["att_ci"][0] > 0
-        for c in conds.values()
-        for bl in ("confusing", "context")
-    )
+    baselines = [(c[bl]["base"] or {}).get("cv") for c in conds.values() for bl in ("confusing", "context")]
+    if not any(baselines):
+        return "Base model fades as much, but baselines not run yet (step 4): can't tell H2 from generic fading", crit
+    generic = any(b and b["att_ci"][0] > 0 for b in baselines)
     if generic:
         return "Generic late-layer fading: baseline signals also fade in the base model; says nothing about H1 vs H2", crit
     return "Base model fades as much and baselines don't: points to H2 (pretraining)", crit

@@ -53,7 +53,7 @@ bash posttrain/run_plan.sh <step>
 | 3 | Main runs: 4 run types × seeds 42 43 44, then 3 comparisons | Done (see "Step 3 results" below) |
 | 4 | Controls + concept-in-context baseline | todo |
 | 5 | Concept identification (mutual information) | todo |
-| 6 | Tuned lens (needs `data/lens_corpus.txt` or the `datasets` package) | todo |
+| 6 | Tuned lens (needs `data/lens_corpus.txt` or the `datasets` package) | Done (wikitext). No base signal; see "Step 6 results" |
 | 7 | Swaps, mean-direction ablation, DLA (only if step 3 shows a difference) | todo |
 | 8 | Self-claims | todo |
 | 9cal / 9 | OLMo-2 32B base/SFT/DPO/Instruct stages (only if step 7 supports H1); export `S_OLMO_BASE/SFT/DPO/INSTRUCT` | todo; OLMo model IDs still need checking |
@@ -142,8 +142,11 @@ What this means:
 3. **Sign-flip issue:** `cv_method` / `fixed_method` in `analyze.py` pick the peak by
    |gap| and flip the sign to match. On introspect, the base gap is *negative*
    (injection → more "no"), so it was flipped and reported as +0.077, and counted toward
-   `base_has_signal`. For detection, H1 is directional, so the sign should be fixed at +
-   (proposed fix, not yet applied).
+   `base_has_signal`. **Fixed (2026-10-28):** `detection_signal` is now `directional`, so
+   the peak is the largest *positive* gap and the sign stays + (cv and fixed). Controls still
+   use |gap|. Side effect: a gap that goes negative at the output now counts as positive
+   attenuation (peak 0, final −0.13 → att +0.13), which makes C1 harder to pass, not easier.
+   The step 3 numbers in this section predate the fix; re-run `compare`.
 4. **The base "peak" is diluted:** the peak is at layer 63, so the ±2 window averages in
    layers 61–62 (~0). That makes base attenuation negative by construction.
 5. **The fixed-window cross-check (75–95% depth) is meaningless with the logit lens.** That
@@ -154,16 +157,55 @@ What this means:
    the CIs are optimistic.
 7. The legend warning in the plots is harmless (cosmetic plot bug).
 
+**After the decision-rule fixes (2026-10-28):**
+- `base_has_signal` now also needs peak ≥ `EXIST_MIN_GAP` (0.05), the same as step 0.
+  Before that, a base introspect peak of +0.002 [+0.001, +0.004] passed.
+- The H2 branch now says "baselines not run yet" when step 4 data is missing.
+
+All three logit-lens comparisons now give **"Inconclusive: no middle-layer signal in the base
+model"**. Base introspect: peak ≈ 0, final −0.13 (vself −0.19); injection pushes the base
+toward "no". Base lorem (vinst): peak +0.078, but only at layer 63.
+
 Conclusion so far: with the logit lens, mid layers can't be read (no yes/no mass), so
 "does the base model carry a mid-layer signal?" is **unanswered**. The tuned lens
 (step 6) is what answers it, so run it next.
+
+## Step 6 results (tuned lens, 2026-10-28)
+
+Lens quality is good. Mid-layer KL to the final output: logit lens ~9.5, tuned lens ~2.6
+(instruct and base alike).
+
+| | Base-vinst lorem | Base-vinst introspect | Base-vself lorem / introspect | Instruct-plain lorem | Instruct-plain introspect |
+|---|---|---|---|---|---|
+| Peak gap (depth) | +0.100 (0.98) | +0.002 [−0.003, +0.008] (0.64) | +0.027 / +0.020 (0.64) | +0.678 (0.89) | +0.317 (0.83) |
+| Final gap | +0.130 | −0.127 | −0.091 / −0.193 | +0.479 | +0.259 |
+
+Verdict in all three comparisons: **Inconclusive: no middle-layer signal in the base model.**
+- The tuned lens doesn't rescue the base model. Its only positive gap is on lorem with
+  instruct vectors, and only at the last layer or two.
+- The instruct signal is also late: it peaks at 0.83–0.89 depth (layers 53–57), not mid-layer.
+  It then attenuates to the output (lorem 0.68 → 0.48; chat introspect 0.44 → 0.27).
+- So H1 can't be tested as set up. Two readings remain: (a) the base few-shot prompt
+  doesn't teach the base model what the question means (it is at ~chance: P(yes) 0.53–0.62
+  with nothing injected, and injection pushes it toward "no"); or (b) the base model has no
+  yes/no-readable detection signal at all, i.e. post-training *creates* the readout rather than
+  suppressing an existing one.
+- **Not in the verdict:** under the tuned lens, injection pushes the base model toward "no" in
+  layers 45–55. Mean gap over layers 47–51 (window picked after looking, so exploratory):
+  base-vinst introspect −0.247 [−0.280, −0.215], base-vself introspect −0.314, base-vself
+  lorem −0.123; 9/9 concepts negative in each. It shrinks toward the output (−0.33 at L49 →
+  −0.13 final). The directional sign fix ignores this by design. The base readout is
+  injection-sensitive; what's missing is the "injected → yes" direction H1 needs.
+- Report: https://claude.ai/artifact/BfpjE5BKC2CfqqdonnVCqt
+- `FEWSHOT_TURNS` is currently 4 world-knowledge questions (yes/no/yes/no), with nothing
+  that depends on the conversation or the model's own state.
 
 ## Next actions
 
 1. **Run step 6 (tuned lens) next**, before 4/5. It only needs the step 3 hiddens.
    It needs `data/lens_corpus.txt` or the `datasets` package in the project env
    (check: `uv run python -c "import datasets"`; if missing: `uv add datasets`).
-2. Decide on the sign-flip fix (item 3 above) before trusting `base_has_signal`.
+2. ~~Sign-flip fix~~ done (item 3 above); re-run the three `compare` commands.
 3. If the tuned lens still shows no base signal: the base few-shot prompt is the
    likely culprit (base says "yes" 53–62% with nothing injected). Revisit `FEWSHOT_TURNS`
    and re-run steps 2–3.
