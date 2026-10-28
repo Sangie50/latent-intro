@@ -10,5 +10,7 @@ wheels/
 .venv
 
 # Project
-outputs/
+outputs/*
+!outputs/posttrain/
+outputs/posttrain/**/*.pt
 .env
